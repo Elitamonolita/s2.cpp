@@ -1,0 +1,144 @@
+name: Build Fish S2 Pro (Windows portable)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 / ${{ matrix.backend }}
+    runs-on: windows-2022
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cpu, cuda, vulkan]
+
+    steps:
+      - name: Checkout s2.cpp and ggml submodule
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install CUDA Toolkit 12.8 (CUDA job only)
+        if: matrix.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '12.8.1'
+          log-file-suffix: 's2-cuda.txt'
+
+      - name: Install Vulkan SDK (Vulkan job only)
+        if: matrix.backend == 'vulkan'
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: '1.4.309.0'
+          cache: true
+
+      - name: Check compilers and SDKs
+        shell: pwsh
+        run: |
+          cmake --version
+          if ('${{ matrix.backend }}' -eq 'cuda') { nvcc --version }
+          if ('${{ matrix.backend }}' -eq 'vulkan') { glslc --version }
+
+      - name: Configure s2.cpp
+        shell: pwsh
+        run: |
+          $args = @(
+            '-S', '.', '-B', 'build',
+            '-G', 'Visual Studio 17 2022', '-A', 'x64',
+            '-DGGML_NATIVE=OFF',
+            '-DS2_CUDA=OFF', '-DS2_VULKAN=OFF'
+          )
+          if ('${{ matrix.backend }}' -eq 'cuda') {
+            $args += '-DS2_CUDA=ON'
+            # RTX 2060 = 75; RTX 5060 Ti = 120; cover additional RTX generations.
+            $args += '-DCMAKE_CUDA_ARCHITECTURES=75;86;89;120'
+          }
+          if ('${{ matrix.backend }}' -eq 'vulkan') {
+            $args += '-DS2_VULKAN=ON'
+          }
+          & cmake @args
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Release
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel 4
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package portable folder
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $backend = '${{ matrix.backend }}'
+          $out = Join-Path $PWD "dist/s2-windows-$backend"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          $exe = Get-ChildItem -Path build -Recurse -File -Filter s2.exe | Select-Object -First 1
+          if (-not $exe) { throw 's2.exe was not produced' }
+          Copy-Item $exe.FullName $out
+
+          $ggmlDlls = @(Get-ChildItem -Path build -Recurse -File -Filter 'ggml*.dll')
+          foreach ($dll in $ggmlDlls) { Copy-Item $dll.FullName $out -Force }
+          foreach ($base in @('ggml.dll', 'ggml-base.dll', 'ggml-cpu.dll')) {
+            if (-not (Test-Path (Join-Path $out $base))) { throw "Required DLL missing: $base" }
+          }
+          if ($backend -eq 'cuda' -and -not (Test-Path (Join-Path $out 'ggml-cuda.dll'))) {
+            throw 'CUDA DLL missing'
+          }
+          if ($backend -eq 'vulkan' -and -not (Test-Path (Join-Path $out 'ggml-vulkan.dll'))) {
+            throw 'Vulkan DLL missing'
+          }
+
+          # Put the CUDA runtime next to s2.exe so end users do not need CUDA Toolkit.
+          if ($backend -eq 'cuda') {
+            if (-not $env:CUDA_PATH) { throw 'CUDA_PATH not found' }
+            $dirs = @((Join-Path $env:CUDA_PATH 'bin'), (Join-Path $env:CUDA_PATH 'bin/x64'))
+            $cudaDlls = @()
+            foreach ($dir in $dirs) {
+              if (Test-Path $dir) {
+                $cudaDlls += Get-ChildItem $dir -File -Filter '*.dll' | Where-Object {
+                  $_.Name -match '^(cudart|cublas|cublasLt|nvrtc|nvrtc-builtins|nvJitLink).*\.dll$'
+                }
+              }
+            }
+            foreach ($dll in $cudaDlls) { Copy-Item $dll.FullName $out -Force }
+            foreach ($pattern in @('cudart*.dll', 'cublas64*.dll', 'cublasLt64*.dll')) {
+              if (-not (Get-ChildItem $out -File -Filter $pattern)) {
+                throw "Missing CUDA runtime dependency: $pattern"
+              }
+            }
+          }
+
+          # Prefer Visual Studio's redistributable CRT DLLs, if installed.
+          $vsRedist = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC'
+          if (Test-Path $vsRedist) {
+            $crtDir = Get-ChildItem $vsRedist -Directory | Sort-Object Name -Descending |
+              ForEach-Object { Join-Path $_.FullName 'x64/Microsoft.VC143.CRT' } |
+              Where-Object { Test-Path $_ } | Select-Object -First 1
+            if ($crtDir) { Get-ChildItem $crtDir -File -Filter '*.dll' | Copy-Item -Destination $out -Force }
+          }
+          Copy-Item tokenizer.json $out
+          @"
+          Fish Speech S2 Pro - $backend Windows x64
+          Source commit: $env:GITHUB_SHA
+          Model weights NOT included. Place s2-pro-q4_k_m.gguf alongside s2.exe.
+          Example (run from this folder):
+          .\s2.exe -m s2-pro-q4_k_m.gguf -t tokenizer.json -text "Privet" -o test.wav
+          For CUDA: add --cuda 0
+          For Vulkan: add --vulkan 0
+          Server: add --server -P 3030
+          "@ | Set-Content (Join-Path $out 'README.txt') -Encoding utf8
+          Write-Host 'Packaged:'
+          Get-ChildItem $out | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Upload portable build
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2-windows-${{ matrix.backend }}
+          path: dist/s2-windows-${{ matrix.backend }}/
+          if-no-files-found: error
+          retention-days: 14
